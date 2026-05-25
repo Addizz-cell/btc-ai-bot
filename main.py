@@ -1,6 +1,7 @@
 import requests
 import pandas as pd
 import yfinance as yf
+import os
 
 from ta.volatility import AverageTrueRange
 from ta.momentum import RSIIndicator
@@ -9,8 +10,9 @@ from ta.trend import EMAIndicator
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = "8991989842:AAEbNKH6w7WBusTzUN1Eo03bAye3yJVqVgo"
-CHAT_ID = "-1003963628576"
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 
 
