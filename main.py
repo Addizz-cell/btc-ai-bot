@@ -188,4 +188,14 @@ TP: ${take_profit:.2f}
 # =========================
 # RUN ONCE (FOR CLOUD)
 # =========================
-# run_bot()
+run_bot()
+
+import time
+
+while True:
+    try:
+        run_bot()
+    except Exception as e:
+        print("Error:", e)
+
+    time.sleep(3600)
