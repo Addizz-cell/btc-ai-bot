@@ -186,4 +186,4 @@ TP: ${take_profit:.2f}
 # =========================
 # RUN ONCE (FOR CLOUD)
 # =========================
-run_bot()
+# run_bot()
