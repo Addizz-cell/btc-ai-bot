@@ -2,6 +2,7 @@ import requests
 import pandas as pd
 import yfinance as yf
 import os
+import time
 
 from ta.volatility import AverageTrueRange
 from ta.momentum import RSIIndicator
@@ -14,9 +15,48 @@ from ta.trend import EMAIndicator
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
+LAST_SIGNAL_FILE = "last_signal.txt"
 
 
+# =========================
+# SAVE SIGNAL
+# =========================
+def save_last_signal(signal):
+    with open(LAST_SIGNAL_FILE, "w") as file:
+        file.write(signal)
+
+
+# =========================
+# LOAD SIGNAL
+# =========================
+def load_last_signal():
+    if not os.path.exists(LAST_SIGNAL_FILE):
+        return None
+
+    with open(LAST_SIGNAL_FILE, "r") as file:
+        return file.read().strip()
+
+
+# =========================
+# SEND TELEGRAM MESSAGE
+# =========================
+def send_telegram(message):
+
+    requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        data={
+            "chat_id": CHAT_ID,
+            "text": message
+        }
+    )
+
+
+# =========================
+# MAIN BOT
+# =========================
 def run_bot():
+
+    print("Running BTC analysis...")
 
     # =========================
     # 1. GET DATA
@@ -60,7 +100,9 @@ def run_bot():
 
     current_price = float(close_prices.iloc[-1])
 
-    # Fix NaN issues
+    # =========================
+    # FIX NAN
+    # =========================
     if pd.isna(current_ema):
         current_ema = current_price
 
@@ -68,7 +110,7 @@ def run_bot():
         current_atr = current_price * 0.01
 
     # =========================
-    # 3. TREND
+    # TREND
     # =========================
     if current_price > current_ema:
         trend = "Bullish 📈"
@@ -76,7 +118,7 @@ def run_bot():
         trend = "Bearish 📉"
 
     # =========================
-    # 4. SIGNAL LOGIC
+    # SIGNAL LOGIC
     # =========================
     if current_rsi < 30 and current_price > current_ema:
         signal = "BUY 📈"
@@ -91,27 +133,27 @@ def run_bot():
         reason = "No strong confirmation"
 
     # =========================
-    # 5. SL & TP
+    # SKIP HOLD SIGNALS
+    # =========================
+    if signal == "HOLD ⏸":
+        print("No trade setup")
+        return
+
+    # =========================
+    # SL & TP
     # =========================
     if signal == "BUY 📈":
         stop_loss = current_price - current_atr
         take_profit = current_price + (current_atr * 2)
 
-    elif signal == "SELL 📉":
+    else:
         stop_loss = current_price + current_atr
         take_profit = current_price - (current_atr * 2)
 
-    else:
-        stop_loss = current_price
-        take_profit = current_price
-
     # =========================
-    # 6. CONFIDENCE SCORE
+    # CONFIDENCE SCORE
     # =========================
-    confidence = 50
-
-    if signal != "HOLD ⏸":
-        confidence += 20
+    confidence = 60
 
     if current_price > current_ema and signal == "BUY 📈":
         confidence += 15
@@ -126,24 +168,48 @@ def run_bot():
         confidence = 100
 
     # =========================
-    # 7. RISK LEVEL SYSTEM
+    # RISK LEVEL
     # =========================
     if confidence >= 80:
         risk_level = "HIGH CONFIDENCE TRADE 🔥"
 
-    elif confidence >= 60:
-        risk_level = "MODERATE CONFIDENCE TRADE ⚠️ (RISK REDUCED)"
-
     else:
-        risk_level = "LOW CONFIDENCE - NO TRADE ❌"
+        risk_level = "MODERATE CONFIDENCE TRADE ⚠️ (REDUCE RISK)"
 
-    # Skip very low confidence trades
-    if confidence < 60:
-        print("Signal skipped (confidence too low)")
+    # =========================
+    # ACTIVE TRADE MEMORY
+    # =========================
+    last_signal = load_last_signal()
+
+    # =========================
+    # SAME SIGNAL STILL ACTIVE
+    # =========================
+    if last_signal == signal:
+
+        message = f"""
+📌 BTC TRADE UPDATE
+
+Previous {signal} signal still active.
+
+Maintain previous position.
+
+BTC Price: ${current_price:.2f}
+
+Trend: {trend}
+
+Confidence: {confidence}%
+
+⚠️ No new entry recommended.
+"""
+
+        send_telegram(message)
+
+        print("Maintaining previous signal")
+
         return
 
     # =========================
-    # 8. TELEGRAM MESSAGE
+    # NEW SIGNAL DETECTED
     # =========================
     message = f"""
 🚨 BTC SMART SIGNAL BOT
@@ -166,35 +232,30 @@ Risk Level: {risk_level}
 SL: ${stop_loss:.2f}
 TP: ${take_profit:.2f}
 
+Reason:
+{reason}
+
 ⚠️ NOTE:
 60–79% trades require reduced risk.
 80%+ are high probability setups.
 """
 
-    # =========================
-    # 9. SEND TO TELEGRAM
-    # =========================
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data={
-            "chat_id": CHAT_ID,
-            "text": message
-        }
-    )
+    send_telegram(message)
 
-    print("BTC smart signal sent!")
+    # SAVE SIGNAL
+    save_last_signal(signal)
+
+    print("New BTC signal sent!")
 
 
 # =========================
-# RUN ONCE (FOR CLOUD)
+# RUN FOREVER
 # =========================
-run_bot()
-
-import time
-
 while True:
+
     try:
         run_bot()
+
     except Exception as e:
         print("Error:", e)
 
