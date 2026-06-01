@@ -4,52 +4,112 @@ import yfinance as yf
 import os
 import time
 
-from ta.volatility import AverageTrueRange
-from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator
-
 # =========================
 # CONFIG
 # =========================
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 LAST_SIGNAL_FILE = "last_signal.txt"
 
-
 # =========================
-# SAVE SIGNAL
+# MEMORY
 # =========================
 def save_last_signal(signal):
-    with open(LAST_SIGNAL_FILE, "w") as file:
-        file.write(signal)
+    with open(LAST_SIGNAL_FILE, "w") as f:
+        f.write(signal)
 
-
-# =========================
-# LOAD SIGNAL
-# =========================
 def load_last_signal():
     if not os.path.exists(LAST_SIGNAL_FILE):
         return None
-
-    with open(LAST_SIGNAL_FILE, "r") as file:
-        return file.read().strip()
-
+    with open(LAST_SIGNAL_FILE, "r") as f:
+        return f.read().strip()
 
 # =========================
-# SEND TELEGRAM MESSAGE
+# TELEGRAM
 # =========================
 def send_telegram(message):
-
     requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         data={
             "chat_id": CHAT_ID,
-            "text": message
+            "text": message,
+            "parse_mode": "Markdown"
         }
     )
 
+# =========================
+# ZONE DETECTION (1H)
+# =========================
+def find_zones(data):
+    levels = []
+
+    for i in range(10, len(data)-10):
+        if data["High"].iloc[i] == data["High"].rolling(10).max().iloc[i]:
+            levels.append(data["High"].iloc[i])
+
+        if data["Low"].iloc[i] == data["Low"].rolling(10).min().iloc[i]:
+            levels.append(data["Low"].iloc[i])
+
+    levels = sorted(levels)
+
+    zones = []
+    for l in levels:
+        if not zones:
+            zones.append(l)
+        elif abs(l - zones[-1]) / l < 0.01:
+            zones[-1] = (zones[-1] + l) / 2
+        else:
+            zones.append(l)
+
+    return zones[:3]
+
+# =========================
+# TREND DETECTION
+# =========================
+def detect_trend(data):
+    mean = data["Close"].rolling(50).mean().iloc[-1]
+    price = data["Close"].iloc[-1]
+
+    if price > mean:
+        return "UP"
+    elif price < mean:
+        return "DOWN"
+    return "RANGE"
+
+# =========================
+# 30M CANDLE PATTERNS
+# =========================
+def bullish_engulfing(o, c, prev_o, prev_c):
+    return c > o and c > prev_o and o < prev_c
+
+def bearish_engulfing(o, c, prev_o, prev_c):
+    return c < o and o > prev_c and c < prev_o
+
+def hammer(o, c, h, l):
+    body = abs(c - o)
+    lower = min(o, c) - l
+    return lower > 2 * body
+
+def shooting_star(o, c, h, l):
+    body = abs(c - o)
+    upper = h - max(o, c)
+    return upper > 2 * body
+
+# =========================
+# CONFIDENCE SCORE
+# =========================
+def confidence(trend, signal, pattern_strength):
+    score = 50
+
+    if trend == "UP" and signal == "BUY":
+        score += 25
+    if trend == "DOWN" and signal == "SELL":
+        score += 25
+
+    score += pattern_strength
+
+    return min(score, 100)
 
 # =========================
 # MAIN BOT
@@ -59,203 +119,105 @@ def run_bot():
     print("Running BTC analysis...")
 
     # =========================
-    # 1. GET DATA
+    # DATA
     # =========================
-    btc = yf.download(
-        tickers="BTC-USD",
-        interval="1h",
-        period="10d"
-    )
+    btc_1h = yf.download("BTC-USD", interval="1h", period="10d")
+    btc_30m = yf.download("BTC-USD", interval="30m", period="3d")
 
-    # Safety check
-    if btc.empty:
-        print("No data received")
+    if btc_1h.empty or btc_30m.empty:
+        print("No data")
         return
 
-    btc = btc.dropna()
+    btc_1h = btc_1h.dropna()
+    btc_30m = btc_30m.dropna()
 
-    btc["Close"] = btc["Close"].astype(float)
-    btc["High"] = btc["High"].astype(float)
-    btc["Low"] = btc["Low"].astype(float)
+    zones = find_zones(btc_1h)
+    trend = detect_trend(btc_1h)
 
-    close_prices = btc["Close"].squeeze()
-
-    # =========================
-    # 2. INDICATORS
-    # =========================
-    rsi = RSIIndicator(close_prices, window=14).rsi()
-    current_rsi = float(rsi.iloc[-1])
-
-    ema = EMAIndicator(close_prices, window=200).ema_indicator()
-    current_ema = float(ema.iloc[-1])
-
-    atr = AverageTrueRange(
-        high=btc["High"].squeeze(),
-        low=btc["Low"].squeeze(),
-        close=btc["Close"].squeeze(),
-        window=14
-    ).average_true_range()
-
-    current_atr = float(atr.iloc[-1])
-
-    current_price = float(close_prices.iloc[-1])
+    price = float(btc_30m["Close"].iloc[-1])
 
     # =========================
-    # FIX NAN
+    # TELEGRAM: MARKET INFO
     # =========================
-    if pd.isna(current_ema):
-        current_ema = current_price
-
-    if pd.isna(current_atr):
-        current_atr = current_price * 0.01
-
-    # =========================
-    # TREND
-    # =========================
-    if current_price > current_ema:
-        trend = "Bullish 📈"
-    else:
-        trend = "Bearish 📉"
-
-    # =========================
-    # SIGNAL LOGIC
-    # =========================
-    if current_rsi < 30 and current_price > current_ema:
-        signal = "BUY 📈"
-        reason = "Oversold RSI + Bullish Trend"
-
-    elif current_rsi > 70 and current_price < current_ema:
-        signal = "SELL 📉"
-        reason = "Overbought RSI + Bearish Trend"
-
-    else:
-        signal = "HOLD ⏸"
-        reason = "No strong confirmation"
-
-    # =========================
-    # SKIP HOLD SIGNALS
-    # =========================
-    if signal == "HOLD ⏸":
-        print("No trade setup")
-        return
-
-    # =========================
-    # SL & TP
-    # =========================
-    if signal == "BUY 📈":
-        stop_loss = current_price - current_atr
-        take_profit = current_price + (current_atr * 2)
-
-    else:
-        stop_loss = current_price + current_atr
-        take_profit = current_price - (current_atr * 2)
-
-    # =========================
-    # CONFIDENCE SCORE
-    # =========================
-    confidence = 60
-
-    if current_price > current_ema and signal == "BUY 📈":
-        confidence += 15
-
-    if current_price < current_ema and signal == "SELL 📉":
-        confidence += 15
-
-    if current_atr > (current_price * 0.003):
-        confidence += 10
-
-    if confidence > 100:
-        confidence = 100
-
-    # =========================
-    # RISK LEVEL
-    # =========================
-    if confidence >= 80:
-        risk_level = "HIGH CONFIDENCE TRADE 🔥"
-
-    else:
-        risk_level = "MODERATE CONFIDENCE TRADE ⚠️ (REDUCE RISK)"
-
-    # =========================
-    # ACTIVE TRADE MEMORY
-    # =========================
-    last_signal = load_last_signal()
-
-    # =========================
-    # SAME SIGNAL STILL ACTIVE
-    # =========================
-    if last_signal == signal:
-
-        message = f"""
-📌 BTC TRADE UPDATE
-
-Previous {signal} signal still active.
-
-Maintain previous position.
-
-BTC Price: ${current_price:.2f}
+    send_telegram(f"""
+📊 *DAILY MARKET SCAN*
 
 Trend: {trend}
+Zones: {zones}
+Current Price: {price}
+""")
 
-Confidence: {confidence}%
-
-⚠️ No new entry recommended.
-"""
-
-        send_telegram(message)
-
-        print("Maintaining previous signal")
-
-        return
+    alerted = set()
+    confirmed = set()
 
     # =========================
-    # NEW SIGNAL DETECTED
+    # SCAN 30M
     # =========================
-    message = f"""
-🚨 BTC SMART SIGNAL BOT
+    for i in range(2, len(btc_30m)):
 
-Timeframe: 1H
+        o = btc_30m["Open"].iloc[i]
+        c = btc_30m["Close"].iloc[i]
+        h = btc_30m["High"].iloc[i]
+        l = btc_30m["Low"].iloc[i]
 
-BTC Price: ${current_price:.2f}
+        prev_o = btc_30m["Open"].iloc[i-1]
+        prev_c = btc_30m["Close"].iloc[i-1]
 
-RSI: {current_rsi:.2f}
-EMA 200: ${current_ema:.2f}
-ATR: ${current_atr:.2f}
+        price = c
 
+        for z in zones:
+
+            # =========================
+            # ZONE ALERT
+            # =========================
+            if abs(price - z) / price < 0.002:
+
+                if z not in alerted:
+                    send_telegram(f"📍 *ZONE ALERT*\nPrice: {price:.2f}\nZone: {z:.2f}")
+                    alerted.add(z)
+
+                # =========================
+                # BUY CONFIRMATION
+                # =========================
+                if bullish_engulfing(o, c, prev_o, prev_c) or hammer(o, c, h, l):
+
+                    score = confidence(trend, "BUY", 35)
+
+                    if z not in confirmed:
+                        send_telegram(f"""
+🟢 *BUY SIGNAL*
+
+Price: {price:.2f}
+Zone: {z:.2f}
 Trend: {trend}
+Confidence: {score}%
+""")
+                        confirmed.add(z)
 
-Signal: {signal}
-Confidence: {confidence}%
+                # =========================
+                # SELL CONFIRMATION
+                # =========================
+                if bearish_engulfing(o, c, prev_o, prev_c) or shooting_star(o, c, h, l):
 
-Risk Level: {risk_level}
+                    score = confidence(trend, "SELL", 35)
 
-SL: ${stop_loss:.2f}
-TP: ${take_profit:.2f}
+                    if z not in confirmed:
+                        send_telegram(f"""
+🔴 *SELL SIGNAL*
 
-Reason:
-{reason}
-
-⚠️ NOTE:
-60–79% trades require reduced risk.
-80%+ are high probability setups.
-"""
-
-    send_telegram(message)
-
-    # SAVE SIGNAL
-    save_last_signal(signal)
-
-    print("New BTC signal sent!")
-
+Price: {price:.2f}
+Zone: {z:.2f}
+Trend: {trend}
+Confidence: {score}%
+""")
+                        confirmed.add(z)
 
 # =========================
-# RUN FOREVER
+# LOOP
 # =========================
 while True:
-
     try:
         run_bot()
-
     except Exception as e:
         print("Error:", e)
 
