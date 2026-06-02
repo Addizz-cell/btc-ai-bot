@@ -10,41 +10,51 @@ import time
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-LAST_SIGNAL_FILE = "last_signal.txt"
-
-# =========================
-# MEMORY
-# =========================
-def save_last_signal(signal):
-    with open(LAST_SIGNAL_FILE, "w") as f:
-        f.write(signal)
-
-def load_last_signal():
-    if not os.path.exists(LAST_SIGNAL_FILE):
-        return None
-    with open(LAST_SIGNAL_FILE, "r") as f:
-        return f.read().strip()
-
 # =========================
 # TELEGRAM
 # =========================
 def send_telegram(message):
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data={
-            "chat_id": CHAT_ID,
-            "text": message,
-            "parse_mode": "Markdown"
-        }
-    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={
+                "chat_id": CHAT_ID,
+                "text": message,
+                "parse_mode": "Markdown"
+            },
+            timeout=10
+        )
+    except Exception as e:
+        print("Telegram error:", e)
 
 # =========================
-# ZONE DETECTION (1H)
+# SAFE DATA CLEANER
+# =========================
+def clean_data(df):
+    if df is None or len(df) == 0:
+        return None
+
+    # remove multi-index issue from yfinance
+    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
+    df = df.dropna()
+
+    # ensure required columns exist
+    required = ["Open", "High", "Low", "Close"]
+    for col in required:
+        if col not in df.columns:
+            return None
+
+    return df
+
+# =========================
+# ZONES (1H STRUCTURE)
 # =========================
 def find_zones(data):
     levels = []
 
-    for i in range(10, len(data)-10):
+    for i in range(10, len(data) - 10):
+
         if data["High"].iloc[i] == data["High"].rolling(10).max().iloc[i]:
             levels.append(data["High"].iloc[i])
 
@@ -57,10 +67,11 @@ def find_zones(data):
     for l in levels:
         if not zones:
             zones.append(l)
-        elif abs(l - zones[-1]) / l < 0.01:
-            zones[-1] = (zones[-1] + l) / 2
         else:
-            zones.append(l)
+            if abs(l - zones[-1]) / l < 0.01:
+                zones[-1] = (zones[-1] + l) / 2
+            else:
+                zones.append(l)
 
     return zones[:3]
 
@@ -80,11 +91,11 @@ def detect_trend(data):
 # =========================
 # 30M CANDLE PATTERNS
 # =========================
-def bullish_engulfing(o, c, prev_o, prev_c):
-    return c > o and c > prev_o and o < prev_c
+def bullish_engulfing(o, c, po, pc):
+    return c > o and c > po and o < pc
 
-def bearish_engulfing(o, c, prev_o, prev_c):
-    return c < o and o > prev_c and c < prev_o
+def bearish_engulfing(o, c, po, pc):
+    return c < o and o > pc and c < po
 
 def hammer(o, c, h, l):
     body = abs(c - o)
@@ -99,7 +110,7 @@ def shooting_star(o, c, h, l):
 # =========================
 # CONFIDENCE SCORE
 # =========================
-def confidence(trend, signal, pattern_strength):
+def confidence(trend, signal, pattern_score):
     score = 50
 
     if trend == "UP" and signal == "BUY":
@@ -107,51 +118,54 @@ def confidence(trend, signal, pattern_strength):
     if trend == "DOWN" and signal == "SELL":
         score += 25
 
-    score += pattern_strength
+    score += pattern_score
 
     return min(score, 100)
 
 # =========================
-# MAIN BOT
+# MAIN BOT LOGIC
 # =========================
 def run_bot():
 
     print("Running BTC analysis...")
 
     # =========================
-    # DATA
+    # DATA DOWNLOAD
     # =========================
     btc_1h = yf.download("BTC-USD", interval="1h", period="10d")
     btc_30m = yf.download("BTC-USD", interval="30m", period="3d")
 
-    if btc_1h.empty or btc_30m.empty:
-        print("No data")
+    btc_1h = clean_data(btc_1h)
+    btc_30m = clean_data(btc_30m)
+
+    if btc_1h is None or btc_30m is None:
+        print("Invalid data received")
         return
 
-    btc_1h = btc_1h.dropna()
-    btc_30m = btc_30m.dropna()
+    if len(btc_1h) < 100 or len(btc_30m) < 50:
+        print("Not enough data")
+        return
 
+    # =========================
+    # ANALYSIS
+    # =========================
     zones = find_zones(btc_1h)
     trend = detect_trend(btc_1h)
 
     price = float(btc_30m["Close"].iloc[-1])
 
-    # =========================
-    # TELEGRAM: MARKET INFO
-    # =========================
-    send_telegram(f"""
-📊 *DAILY MARKET SCAN*
-
-Trend: {trend}
-Zones: {zones}
-Current Price: {price}
-""")
+    send_telegram(
+        f"📊 *MARKET SCAN*\n\n"
+        f"Trend: {trend}\n"
+        f"Zones: {zones}\n"
+        f"Price: {price}"
+    )
 
     alerted = set()
     confirmed = set()
 
     # =========================
-    # SCAN 30M
+    # 30M SCAN
     # =========================
     for i in range(2, len(btc_30m)):
 
@@ -160,8 +174,8 @@ Current Price: {price}
         h = btc_30m["High"].iloc[i]
         l = btc_30m["Low"].iloc[i]
 
-        prev_o = btc_30m["Open"].iloc[i-1]
-        prev_c = btc_30m["Close"].iloc[i-1]
+        po = btc_30m["Open"].iloc[i - 1]
+        pc = btc_30m["Close"].iloc[i - 1]
 
         price = c
 
@@ -173,47 +187,49 @@ Current Price: {price}
             if abs(price - z) / price < 0.002:
 
                 if z not in alerted:
-                    send_telegram(f"📍 *ZONE ALERT*\nPrice: {price:.2f}\nZone: {z:.2f}")
+                    send_telegram(
+                        f"📍 *ZONE ALERT*\n"
+                        f"Price: {price:.2f}\n"
+                        f"Zone: {z:.2f}"
+                    )
                     alerted.add(z)
 
                 # =========================
-                # BUY CONFIRMATION
+                # BUY
                 # =========================
-                if bullish_engulfing(o, c, prev_o, prev_c) or hammer(o, c, h, l):
+                if bullish_engulfing(o, c, po, pc) or hammer(o, c, h, l):
 
                     score = confidence(trend, "BUY", 35)
 
                     if z not in confirmed:
-                        send_telegram(f"""
-🟢 *BUY SIGNAL*
-
-Price: {price:.2f}
-Zone: {z:.2f}
-Trend: {trend}
-Confidence: {score}%
-""")
+                        send_telegram(
+                            f"🟢 *BUY SIGNAL*\n\n"
+                            f"Price: {price:.2f}\n"
+                            f"Zone: {z:.2f}\n"
+                            f"Trend: {trend}\n"
+                            f"Confidence: {score}%"
+                        )
                         confirmed.add(z)
 
                 # =========================
-                # SELL CONFIRMATION
+                # SELL
                 # =========================
-                if bearish_engulfing(o, c, prev_o, prev_c) or shooting_star(o, c, h, l):
+                if bearish_engulfing(o, c, po, pc) or shooting_star(o, c, h, l):
 
                     score = confidence(trend, "SELL", 35)
 
                     if z not in confirmed:
-                        send_telegram(f"""
-🔴 *SELL SIGNAL*
-
-Price: {price:.2f}
-Zone: {z:.2f}
-Trend: {trend}
-Confidence: {score}%
-""")
+                        send_telegram(
+                            f"🔴 *SELL SIGNAL*\n\n"
+                            f"Price: {price:.2f}\n"
+                            f"Zone: {z:.2f}\n"
+                            f"Trend: {trend}\n"
+                            f"Confidence: {score}%"
+                        )
                         confirmed.add(z)
 
 # =========================
-# LOOP
+# LOOP (SAFE)
 # =========================
 while True:
     try:
