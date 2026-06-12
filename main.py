@@ -1,9 +1,8 @@
 import requests
-import pandas as pd
-import yfinance as yf
-import os
 import time
+import os
 import json
+import feedparser
 from datetime import datetime
 
 # =========================
@@ -12,35 +11,35 @@ from datetime import datetime
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-STATE_FILE = "state.json"
+STATE_FILE = "news_state.json"
 
-ZONE_THRESHOLD = 0.0018  # 0.18%
+# =========================
+# SOURCES (FREE RSS)
+# =========================
+RSS_FEEDS = [
+    "https://www.federalreserve.gov/feeds/press_all.xml",
+    "https://finance.yahoo.com/news/rssindex",
+]
 
 # =========================
 # TELEGRAM
 # =========================
-def send_telegram(message):
+def send_telegram(msg):
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": message},
+            data={"chat_id": CHAT_ID, "text": msg},
             timeout=10
         )
     except Exception as e:
         print("Telegram error:", e)
 
 # =========================
-# STATE HANDLING
+# STATE
 # =========================
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {
-            "date": "",
-            "zones": [],
-            "alerted": [],
-            "traded": [],
-            "breakout_wait": {}
-        }
+        return {"seen": []}
 
     with open(STATE_FILE, "r") as f:
         return json.load(f)
@@ -49,200 +48,118 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
-def new_day(state):
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+# =========================
+# USD KEYWORDS ENGINE
+# =========================
+BULLISH = [
+    "inflation rises", "cpi higher", "strong jobs", "nfp beats",
+    "interest rate hike", "hawkish", "strong dollar", "fomc raises"
+]
 
-    if state["date"] != today:
-        state["date"] = today
-        state["zones"] = []
-        state["alerted"] = []
-        state["traded"] = []
-        state["breakout_wait"] = {}
-        return True
+BEARISH = [
+    "inflation falls", "cpi lower", "weak jobs", "nfp misses",
+    "rate cut", "dovish", "recession", "usd weak"
+]
 
-    return False
+HIGH_IMPACT = [
+    "cpi", "nfp", "fomc", "interest rate", "fed", "unemployment", "gdp"
+]
 
 # =========================
-# DATA CLEAN
+# ANALYZE NEWS
 # =========================
-def clean(df):
-    if df is None or df.empty:
-        return None
+def analyze(text):
 
-    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-    df = df.dropna()
+    t = text.lower()
 
-    return df
+    score = 50
 
-# =========================
-# ZONE GENERATION (1H)
-# =========================
-def find_zones(df):
-    levels = []
+    # direction
+    for w in BULLISH:
+        if w in t:
+            score += 10
 
-    for i in range(10, len(df) - 10):
-        if df["High"].iloc[i] == df["High"].rolling(10).max().iloc[i]:
-            levels.append(df["High"].iloc[i])
+    for w in BEARISH:
+        if w in t:
+            score -= 10
 
-        if df["Low"].iloc[i] == df["Low"].rolling(10).min().iloc[i]:
-            levels.append(df["Low"].iloc[i])
+    # high impact boost
+    for w in HIGH_IMPACT:
+        if w in t:
+            score += 5
 
-    levels = sorted(levels)
+    if score >= 65:
+        bias = "🟢 BULLISH USD"
+    elif score <= 35:
+        bias = "🔴 BEARISH USD"
+    else:
+        bias = "⚪ NEUTRAL USD"
 
-    zones = []
-    for l in levels:
-        if not zones:
-            zones.append(l)
-        else:
-            if abs(l - zones[-1]) / l < ZONE_THRESHOLD:
-                zones[-1] = (zones[-1] + l) / 2
-            else:
-                zones.append(l)
+    confidence = min(100, abs(score - 50) * 2 + 50)
 
-    return zones[:3]
+    return bias, confidence
 
 # =========================
-# TREND
+# FETCH NEWS
 # =========================
-def trend(df):
-    ma = df["Close"].rolling(50).mean().iloc[-1]
-    price = df["Close"].iloc[-1]
+def fetch_news():
+    news_items = []
 
-    if price > ma:
-        return "UP"
-    elif price < ma:
-        return "DOWN"
-    return "RANGE"
+    for url in RSS_FEEDS:
+        feed = feedparser.parse(url)
 
-# =========================
-# CANDLE PATTERNS
-# =========================
-def bullish_engulf(o, c, po, pc):
-    return c > o and c > po and o < pc
+        for entry in feed.entries[:10]:
+            news_items.append({
+                "title": entry.title,
+                "link": entry.link
+            })
 
-def bearish_engulf(o, c, po, pc):
-    return c < o and o < po and c < pc
-
-def hammer(o, c, h, l):
-    body = abs(c - o)
-    return (min(o, c) - l) > 2 * body
-
-def shooting_star(o, c, h, l):
-    body = abs(c - o)
-    return (h - max(o, c)) > 2 * body
+    return news_items
 
 # =========================
-# CONFIDENCE
+# MAIN LOOP
 # =========================
-def score(trend_dir, signal, pattern_bonus):
-    base = 50
+def run():
 
-    if trend_dir == "UP" and signal == "BUY":
-        base += 25
-    if trend_dir == "DOWN" and signal == "SELL":
-        base += 25
-
-    base += pattern_bonus
-    return min(base, 100)
-
-# =========================
-# DAILY SCAN (11 PM LOGIC)
-# =========================
-def daily_scan(state, btc_1h):
-    state["zones"] = find_zones(btc_1h)
-    t = trend(btc_1h)
-
-    zones_clean = [round(float(z), 2) for z in state["zones"]]
-
-    send_telegram(
-        f"📊 DAILY MARKET SCAN\n\n"
-        f"Trend: {t}\n"
-        f"Zones:\n{zones_clean}\n"
-        f"\nMonitoring market..."
-    )
-
-# =========================
-# MAIN BOT
-# =========================
-def run_bot():
     state = load_state()
+    seen = set(state["seen"])
 
-    btc_1h = clean(yf.download("BTC-USD", interval="1h", period="10d"))
-    btc_30m = clean(yf.download("BTC-USD", interval="30m", period="3d"))
+    news = fetch_news()
 
-    if btc_1h is None or btc_30m is None:
-        return
+    for item in news:
 
-    if len(btc_1h) < 100 or len(btc_30m) < 50:
-        return
+        title = item["title"]
 
-    # NEW DAY RESET
-    if new_day(state):
-        daily_scan(state, btc_1h)
-        save_state(state)
+        if title in seen:
+            continue
 
-    current_price = float(btc_30m["Close"].iloc[-1])
+        bias, confidence = analyze(title)
 
-    t = trend(btc_1h)
+        # only send strong signals
+        if confidence < 60:
+            continue
 
-    latest = btc_30m.iloc[-1]
-    prev = btc_30m.iloc[-2]
+        msg = f"""
+🚨 USD NEWS ALERT
 
-    o, c, h, l = latest["Open"], latest["Close"], latest["High"], latest["Low"]
-    po, pc = prev["Open"], prev["Close"]
+Headline:
+{title}
 
-    # =========================
-    # LOOP ZONES
-    # =========================
-    for z in state["zones"]:
+Bias:
+{bias}
 
-        z = float(z)
+Confidence:
+{confidence}%
 
-        # =========================
-        # ZONE ENTRY CHECK
-        # =========================
-        if abs(current_price - z) / current_price <= ZONE_THRESHOLD:
+Time:
+{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
+"""
 
-            if z not in state["alerted"]:
-                send_telegram(
-                    f"📍 ZONE ALERT\n\n"
-                    f"Price: {current_price:.2f}\n"
-                    f"Zone: {z:.2f}\n"
-                    f"Waiting for 30m confirmation..."
-                )
-                state["alerted"].append(z)
+        send_telegram(msg)
 
-            # =========================
-            # CONFIRMATION
-            # =========================
-            if bullish_engulf(o, c, po, pc) or hammer(o, c, h, l):
+        seen.add(title)
 
-                if z not in state["traded"]:
-                    s = score(t, "BUY", 35)
-
-                    send_telegram(
-                        f"🟢 BUY SIGNAL\n\n"
-                        f"Zone: {z:.2f}\n"
-                        f"Price: {current_price:.2f}\n"
-                        f"Confidence: {s}%"
-                    )
-
-                    state["traded"].append(z)
-
-            if bearish_engulf(o, c, po, pc) or shooting_star(o, c, h, l):
-
-                if z not in state["traded"]:
-                    s = score(t, "SELL", 35)
-
-                    send_telegram(
-                        f"🔴 SELL SIGNAL\n\n"
-                        f"Zone: {z:.2f}\n"
-                        f"Price: {current_price:.2f}\n"
-                        f"Confidence: {s}%"
-                    )
-
-                    state["traded"].append(z)
-
+    state["seen"] = list(seen)[-200:]
     save_state(state)
 
 # =========================
@@ -250,8 +167,8 @@ def run_bot():
 # =========================
 while True:
     try:
-        run_bot()
+        run()
     except Exception as e:
         print("Error:", e)
 
-    time.sleep(300)  # 5 minutes
+    time.sleep(300)
