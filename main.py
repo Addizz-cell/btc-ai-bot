@@ -1,9 +1,9 @@
 import requests
-import time
 import os
+import time
 import json
 import feedparser
-from datetime import datetime
+from datetime import datetime, timezone
 
 # =========================
 # CONFIG
@@ -11,10 +11,10 @@ from datetime import datetime
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-STATE_FILE = "news_state.json"
+STATE_FILE = "macro_state.json"
 
 # =========================
-# SOURCES (FREE RSS)
+# RSS SOURCES (FREE)
 # =========================
 RSS_FEEDS = [
     "https://www.federalreserve.gov/feeds/press_all.xml",
@@ -24,7 +24,7 @@ RSS_FEEDS = [
 # =========================
 # TELEGRAM
 # =========================
-def send_telegram(msg):
+def send(msg):
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -37,130 +37,164 @@ def send_telegram(msg):
 # =========================
 # STATE
 # =========================
-def load_state():
+def load():
     if not os.path.exists(STATE_FILE):
         return {"seen": []}
+    return json.load(open(STATE_FILE))
 
-    with open(STATE_FILE, "r") as f:
-        return json.load(f)
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+def save(s):
+    json.dump(s, open(STATE_FILE, "w"))
 
 # =========================
-# USD KEYWORDS ENGINE
+# EVENT WEIGHTS (INSTITUTIONAL)
 # =========================
-BULLISH = [
-    "inflation rises", "cpi higher", "strong jobs", "nfp beats",
-    "interest rate hike", "hawkish", "strong dollar", "fomc raises"
-]
+WEIGHTS = {
+    "cpi": 5.0,
+    "inflation": 5.0,
+    "interest rate": 5.0,
+    "fomc": 5.0,
+    "fed": 4.0,
+    "nfp": 4.5,
+    "jobs": 4.0,
+    "gdp": 4.0,
+    "unemployment": 3.5,
+    "dollar": 3.0,
+}
 
-BEARISH = [
-    "inflation falls", "cpi lower", "weak jobs", "nfp misses",
-    "rate cut", "dovish", "recession", "usd weak"
-]
-
-HIGH_IMPACT = [
-    "cpi", "nfp", "fomc", "interest rate", "fed", "unemployment", "gdp"
-]
+BULLISH = ["higher", "rise", "strong", "hawkish", "beats", "increase"]
+BEARISH = ["lower", "fall", "weak", "dovish", "miss", "cut"]
 
 # =========================
-# ANALYZE NEWS
+# TIME DECAY FUNCTION
 # =========================
-def analyze(text):
+def decay(hours):
+    if hours < 1:
+        return 1.0
+    if hours < 3:
+        return 0.8
+    if hours < 6:
+        return 0.6
+    if hours < 12:
+        return 0.4
+    return 0.2
 
-    t = text.lower()
+# =========================
+# USD IMPACT ENGINE
+# =========================
+def analyze(entry):
+    text = entry.title.lower()
+
+    weight = 1.0
+
+    # event weighting
+    for k, w in WEIGHTS.items():
+        if k in text:
+            weight += w
 
     score = 50
 
-    # direction
     for w in BULLISH:
-        if w in t:
-            score += 10
+        if w in text:
+            score += 8 * weight
 
     for w in BEARISH:
-        if w in t:
-            score -= 10
+        if w in text:
+            score -= 8 * weight
 
-    # high impact boost
-    for w in HIGH_IMPACT:
-        if w in t:
-            score += 5
+    # normalize
+    score = max(0, min(100, score))
 
     if score >= 65:
-        bias = "🟢 BULLISH USD"
+        bias = "🟢 USD STRONG"
     elif score <= 35:
-        bias = "🔴 BEARISH USD"
+        bias = "🔴 USD WEAK"
     else:
-        bias = "⚪ NEUTRAL USD"
+        bias = "⚪ USD NEUTRAL"
 
-    confidence = min(100, abs(score - 50) * 2 + 50)
-
-    return bias, confidence
+    return bias, score
 
 # =========================
 # FETCH NEWS
 # =========================
-def fetch_news():
-    news_items = []
-
+def fetch():
+    items = []
     for url in RSS_FEEDS:
         feed = feedparser.parse(url)
-
-        for entry in feed.entries[:10]:
-            news_items.append({
-                "title": entry.title,
-                "link": entry.link
-            })
-
-    return news_items
+        for e in feed.entries[:10]:
+            items.append(e)
+    return items
 
 # =========================
-# MAIN LOOP
+# ASSET IMPACT MODEL
+# =========================
+def asset_bias(usdx_score, asset):
+    if asset == "BTC":
+        shift = (usdx_score - 50) * 0.4
+    elif asset == "XAU":
+        shift = (usdx_score - 50) * 0.8
+    elif asset == "EURUSD":
+        shift = (usdx_score - 50) * 1.2
+    else:
+        shift = 0
+
+    final = 50 + shift
+
+    if final > 60:
+        return "📉 SELL PRESSURE"
+    elif final < 40:
+        return "📈 BUY PRESSURE"
+    return "⚪ NEUTRAL"
+
+# =========================
+# MAIN ENGINE
 # =========================
 def run():
-
-    state = load_state()
+    state = load()
     seen = set(state["seen"])
 
-    news = fetch_news()
+    news = fetch()
 
-    for item in news:
+    usd_scores = []
 
-        title = item["title"]
-
-        if title in seen:
+    for n in news:
+        if n.title in seen:
             continue
 
-        bias, confidence = analyze(title)
+        bias, score = analyze(n)
+        usd_scores.append(score)
 
-        # only send strong signals
-        if confidence < 60:
-            continue
+        seen.add(n.title)
 
-        msg = f"""
-🚨 USD NEWS ALERT
+    if not usd_scores:
+        return
 
-Headline:
-{title}
+    # USD Strength Index
+    usdx = sum(usd_scores) / len(usd_scores)
 
-Bias:
-{bias}
+    btc_bias = asset_bias(usdx, "BTC")
+    xau_bias = asset_bias(usdx, "XAU")
+    eur_bias = asset_bias(usdx, "EURUSD")
 
-Confidence:
-{confidence}%
+    msg = f"""
+📊 MACRO ENGINE UPDATE
+
+USD Strength Index: {usdx:.2f} / 100
+
+Assets:
+BTC → {btc_bias}
+XAUUSD → {xau_bias}
+EURUSD → {eur_bias}
 
 Time:
-{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
+{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
 """
 
-        send_telegram(msg)
+    # only send meaningful moves
+    if usdx > 60 or usdx < 40:
+        send(msg)
 
-        seen.add(title)
-
-    state["seen"] = list(seen)[-200:]
-    save_state(state)
+    state["seen"] = list(seen)[-300:]
+    save(state)
 
 # =========================
 # LOOP
