@@ -26,389 +26,222 @@ RSS_FEEDS = [
 # TELEGRAM
 # =========================
 def send(msg):
-
     try:
-
-        response = requests.post(
+        requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={
-                "chat_id": CHAT_ID,
-                "text": msg
-            },
+            data={"chat_id": CHAT_ID, "text": msg},
             timeout=10
         )
-
-        print("Telegram Status:", response.status_code)
-
     except Exception as e:
         print("Telegram Error:", e)
-
 
 # =========================
 # STATE
 # =========================
 def load():
-
-    try:
-
-        if not os.path.exists(STATE_FILE):
-            print("Creating new state")
-            return {"seen": []}
-
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-
-    except Exception as e:
-
-        print("STATE LOAD ERROR:", e)
-
+    if not os.path.exists(STATE_FILE):
         return {"seen": []}
-
+    with open(STATE_FILE, "r") as f:
+        return json.load(f)
 
 def save(state):
-
-    try:
-
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f)
-
-    except Exception as e:
-
-        print("STATE SAVE ERROR:", e)
-
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
 
 # =========================
-# EVENT WEIGHTS
+# EVENT WEIGHTS (UPGRADED)
 # =========================
 WEIGHTS = {
-    "cpi": 5.0,
-    "inflation": 5.0,
-    "interest rate": 5.0,
-    "fomc": 5.0,
-    "fed": 4.0,
-    "nfp": 4.5,
-    "jobs": 4.0,
-    "gdp": 4.0,
-    "unemployment": 3.5,
-    "dollar": 3.0,
+    "cpi": 10,
+    "inflation": 10,
+    "interest rate": 15,
+    "fomc": 20,
+    "fed": 12,
+    "nfp": 18,
+    "jobs": 10,
+    "gdp": 10,
+    "unemployment": 8,
+    "dollar": 6,
+    "powell": 12
 }
 
-BULLISH = [
-    "higher",
-    "rise",
-    "strong",
-    "hawkish",
-    "beats",
-    "increase"
-]
-
-BEARISH = [
-    "lower",
-    "fall",
-    "weak",
-    "dovish",
-    "miss",
-    "cut"
-]
+BULLISH = ["higher", "rise", "strong", "hawkish", "beats", "increase", "tighten"]
+BEARISH = ["lower", "fall", "weak", "dovish", "miss", "cut", "slow"]
 
 # =========================
-# TIME DECAY
+# EVENT DETECTOR (NEW)
 # =========================
-def decay(hours):
+def detect_event(text):
 
-    if hours < 1:
-        return 1.0
+    events = []
 
-    if hours < 3:
-        return 0.8
+    for k in WEIGHTS.keys():
+        if k in text:
+            events.append(k.upper())
 
-    if hours < 6:
-        return 0.6
-
-    if hours < 12:
-        return 0.4
-
-    return 0.2
-
+    return events
 
 # =========================
-# ANALYZE ARTICLE
+# ANALYZE
 # =========================
 def analyze(entry):
 
     text = entry.title.lower()
 
     weight = 1.0
+    events = detect_event(text)
 
     for keyword, value in WEIGHTS.items():
-
         if keyword in text:
             weight += value
 
     score = 50
 
-    for word in BULLISH:
+    for w in BULLISH:
+        if w in text:
+            score += 7 * weight
 
-        if word in text:
-            score += (8 * weight)
-
-    for word in BEARISH:
-
-        if word in text:
-            score -= (8 * weight)
+    for w in BEARISH:
+        if w in text:
+            score -= 7 * weight
 
     score = max(0, min(100, score))
 
     if score >= 65:
         bias = "🟢 USD STRONG"
-
     elif score <= 35:
         bias = "🔴 USD WEAK"
-
     else:
         bias = "⚪ USD NEUTRAL"
 
-    return bias, score
-
+    return bias, score, events
 
 # =========================
-# FETCH NEWS
+# FETCH
 # =========================
 def fetch():
 
-    articles = []
+    items = []
 
     for url in RSS_FEEDS:
 
         try:
-
-            print(f"Fetching: {url}")
-
             feed = feedparser.parse(url)
 
-            print(
-                f"Feed returned {len(feed.entries)} articles"
-            )
-
-            for entry in feed.entries[:10]:
-                articles.append(entry)
+            for e in feed.entries[:10]:
+                items.append(e)
 
         except Exception as e:
+            print("Feed error:", e)
 
-            print(
-                f"Feed Error {url}: {e}"
-            )
-
-    return articles
-
+    return items
 
 # =========================
 # ASSET IMPACT
 # =========================
-def asset_bias(usdx_score, asset):
+def asset_bias(usdx, asset):
 
     if asset == "BTC":
-
-        shift = (
-            (usdx_score - 50)
-            * 0.4
-        )
-
+        shift = (usdx - 50) * 0.4
     elif asset == "XAU":
-
-        shift = (
-            (usdx_score - 50)
-            * 0.8
-        )
-
+        shift = (usdx - 50) * 0.8
     elif asset == "EURUSD":
-
-        shift = (
-            (usdx_score - 50)
-            * 1.2
-        )
-
+        shift = (usdx - 50) * 1.2
     else:
-
         shift = 0
 
     final = 50 + shift
 
     if final > 60:
         return "📉 SELL PRESSURE"
-
-    if final < 40:
+    elif final < 40:
         return "📈 BUY PRESSURE"
-
     return "⚪ NEUTRAL"
 
-
 # =========================
-# MAIN ENGINE
+# ENGINE
 # =========================
 def run():
 
-    print(
-        "\n================================"
-    )
-
-    print(
-        "SCAN STARTED:",
-        datetime.now(timezone.utc)
-    )
-
     state = load()
-
-    seen = set(
-        state["seen"]
-    )
-
-    print(
-        "Previously seen:",
-        len(seen)
-    )
+    seen = set(state["seen"])
 
     news = fetch()
 
-    print(
-        "Total articles fetched:",
-        len(news)
-    )
-
     usd_scores = []
+    event_hits = []
 
-    for article in news:
+    for n in news:
 
-        if article.title in seen:
+        if n.title in seen:
             continue
 
-        bias, score = analyze(article)
+        bias, score, events = analyze(n)
 
-        print(
-            "\nNEW ARTICLE:"
-        )
-
-        print(
-            article.title
-        )
-
-        print(
-            f"Bias={bias}"
-        )
-
-        print(
-            f"Score={score}"
-        )
+        print("\nTITLE:", n.title)
+        print("BIAS:", bias)
+        print("SCORE:", score)
+        print("EVENTS:", events)
 
         usd_scores.append(score)
 
-        seen.add(
-            article.title
-        )
+        if events:
+            event_hits.append((n.title, events))
 
-    print(
-        "New articles found:",
-        len(usd_scores)
-    )
+        seen.add(n.title)
 
     if not usd_scores:
-
-        print(
-            "No new articles."
-        )
-
         return
 
-    usdx = (
-        sum(usd_scores)
-        / len(usd_scores)
-    )
+    usdx = sum(usd_scores) / len(usd_scores)
 
-    print(
-        f"USD INDEX: {usdx:.2f}"
-    )
+    btc = asset_bias(usdx, "BTC")
+    xau = asset_bias(usdx, "XAU")
+    eur = asset_bias(usdx, "EURUSD")
 
-    btc_bias = asset_bias(
-        usdx,
-        "BTC"
-    )
-
-    xau_bias = asset_bias(
-        usdx,
-        "XAU"
-    )
-
-    eur_bias = asset_bias(
-        usdx,
-        "EURUSD"
-    )
-
+    # BUILD MESSAGE
     msg = f"""
 📊 MACRO ENGINE UPDATE
 
-USD Strength Index:
-{usdx:.2f}/100
+USD Strength Index: {usdx:.2f}
 
 Assets:
+BTC → {btc}
+XAUUSD → {xau}
+EURUSD → {eur}
 
-BTC → {btc_bias}
-
-XAUUSD → {xau_bias}
-
-EURUSD → {eur_bias}
-
-Time:
-{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+Top Event(s):
 """
 
-    if usdx > 60 or usdx < 40:
+    for t, ev in event_hits[:3]:
+        msg += f"\n- {ev} → {t[:60]}..."
 
-        print(
-            "ALERT SENT"
-        )
+    msg += f"\n\nTime: {datetime.now(timezone.utc)}"
+
+    # SMART ALERT CONDITION (IMPROVED)
+    major_event = any(
+        any(k in t.lower() for k in ["fomc", "cpi", "nfp", "interest rate"])
+        for t, _ in event_hits
+    )
+
+    if usdx > 60 or usdx < 40 or major_event:
 
         send(msg)
+        print("ALERT SENT")
 
     else:
-
-        print(
-            "No alert threshold reached."
-        )
+        print("No strong signal")
 
     state["seen"] = list(seen)[-300:]
-
     save(state)
-
-    print(
-        "State saved."
-    )
-
-    print(
-        "SCAN COMPLETE"
-    )
-
 
 # =========================
 # LOOP
 # =========================
 while True:
-
     try:
-
         run()
-
     except Exception:
-
-        print(
-            "\nMAIN LOOP ERROR"
-        )
-
-        print(
-            traceback.format_exc()
-        )
-
-    print(
-        "Sleeping 300 seconds..."
-    )
+        print(traceback.format_exc())
 
     time.sleep(300)
