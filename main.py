@@ -1,4 +1,4 @@
-import requests
+ import requests
 import os
 import time
 import json
@@ -36,64 +36,78 @@ def send(msg):
         print("Telegram Error:", e)
 
 # =========================
-# STATE
+# STATE (UPDATED SAFE)
 # =========================
 def load():
     if not os.path.exists(STATE_FILE):
-        return {"seen": []}
+        return {
+            "seen": [],
+            "usdx": 50
+        }
+
     with open(STATE_FILE, "r") as f:
-        return json.load(f)
+        state = json.load(f)
+
+    if "seen" not in state:
+        state["seen"] = []
+
+    if "usdx" not in state:
+        state["usdx"] = 50
+
+    return state
+
 
 def save(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
 # =========================
-# EVENT WEIGHTS (UPGRADED)
+# MACRO KEYWORDS (FILTER CORE)
 # =========================
 WEIGHTS = {
-    "cpi": 10,
-    "inflation": 10,
-    "interest rate": 15,
     "fomc": 20,
-    "fed": 12,
+    "federal reserve": 20,
+    "interest rate": 20,
+    "rate decision": 20,
+    "powell": 15,
+    "cpi": 18,
+    "inflation": 15,
+    "pce": 15,
     "nfp": 18,
-    "jobs": 10,
-    "gdp": 10,
-    "unemployment": 8,
-    "dollar": 6,
-    "powell": 12
+    "nonfarm payroll": 18,
+    "jobless claims": 15,
+    "adp employment": 12,
+    "jolts": 12,
+    "unemployment rate": 15,
+    "gdp": 12,
+    "treasury yield": 12,
+    "us dollar index": 10
 }
 
 BULLISH = ["higher", "rise", "strong", "hawkish", "beats", "increase", "tighten"]
 BEARISH = ["lower", "fall", "weak", "dovish", "miss", "cut", "slow"]
 
 # =========================
-# EVENT DETECTOR (NEW)
+# MACRO FILTER (NEW - IMPORTANT)
 # =========================
-def detect_event(text):
-
-    events = []
-
-    for k in WEIGHTS.keys():
-        if k in text:
-            events.append(k.upper())
-
-    return events
+def is_macro_news(text):
+    text = text.lower()
+    return any(k in text for k in WEIGHTS.keys())
 
 # =========================
-# ANALYZE
+# ANALYZE ARTICLE
 # =========================
 def analyze(entry):
 
     text = entry.title.lower()
 
     weight = 1.0
-    events = detect_event(text)
+    matched_events = []
 
-    for keyword, value in WEIGHTS.items():
-        if keyword in text:
-            weight += value
+    for k, v in WEIGHTS.items():
+        if k in text:
+            weight += v
+            matched_events.append(k.upper())
 
     score = 50
 
@@ -114,10 +128,10 @@ def analyze(entry):
     else:
         bias = "⚪ USD NEUTRAL"
 
-    return bias, score, events
+    return bias, score, matched_events
 
 # =========================
-# FETCH
+# FETCH NEWS
 # =========================
 def fetch():
 
@@ -137,7 +151,7 @@ def fetch():
     return items
 
 # =========================
-# ASSET IMPACT
+# ASSET IMPACT MODEL
 # =========================
 def asset_bias(usdx, asset):
 
@@ -159,9 +173,12 @@ def asset_bias(usdx, asset):
     return "⚪ NEUTRAL"
 
 # =========================
-# ENGINE
+# MAIN ENGINE
 # =========================
 def run():
+
+    print("\n==============================")
+    print("SCAN:", datetime.now(timezone.utc))
 
     state = load()
     seen = set(state["seen"])
@@ -174,6 +191,10 @@ def run():
     for n in news:
 
         if n.title in seen:
+            continue
+
+        # 🔥 FILTER OUT NON-MACRO NEWS
+        if not is_macro_news(n.title):
             continue
 
         bias, score, events = analyze(n)
@@ -191,15 +212,30 @@ def run():
         seen.add(n.title)
 
     if not usd_scores:
+
+        print("No macro news detected.")
         return
 
-    usdx = sum(usd_scores) / len(usd_scores)
+    # =========================
+    # ROLLING USD MEMORY (IMPORTANT FIX)
+    # =========================
+    latest_usdx = sum(usd_scores) / len(usd_scores)
+
+    old_usdx = state.get("usdx", 50)
+
+    usdx = (old_usdx * 0.7) + (latest_usdx * 0.3)
+
+    state["usdx"] = round(usdx, 2)
+
+    print("USD INDEX:", usdx)
 
     btc = asset_bias(usdx, "BTC")
     xau = asset_bias(usdx, "XAU")
     eur = asset_bias(usdx, "EURUSD")
 
-    # BUILD MESSAGE
+    # =========================
+    # MESSAGE FORMAT (UNCHANGED STYLE)
+    # =========================
     msg = f"""
 📊 MACRO ENGINE UPDATE
 
@@ -218,7 +254,9 @@ Top Event(s):
 
     msg += f"\n\nTime: {datetime.now(timezone.utc)}"
 
-    # SMART ALERT CONDITION (IMPROVED)
+    # =========================
+    # SMART ALERT CONDITION
+    # =========================
     major_event = any(
         any(k in t.lower() for k in ["fomc", "cpi", "nfp", "interest rate"])
         for t, _ in event_hits
@@ -230,7 +268,7 @@ Top Event(s):
         print("ALERT SENT")
 
     else:
-        print("No strong signal")
+        print("No signal zone")
 
     state["seen"] = list(seen)[-300:]
     save(state)
